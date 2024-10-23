@@ -47,9 +47,7 @@ train_data = Dataset.from_pandas(train_data)
 val_data = Dataset.from_pandas(val_data)
 test_data = Dataset.from_pandas(test_data)
 
-from huggingface_hub import login
 
-login(token='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')
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AdamW, BitsAndBytesConfig, get_scheduler, DataCollatorWithPadding
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
