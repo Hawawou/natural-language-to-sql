@@ -37,16 +37,9 @@ df = pd.DataFrame(train_data)
 df2 = pd.DataFrame(val_data)
 df3 = pd.DataFrame(test_data)
 
-train_data = df[["messages"]]
-val_data = df2[["messages"]]
-test_data = df3[["messages"]]
-
-# convert to Dataset
-from datasets import Dataset
-train_data = Dataset.from_pandas(train_data)
-val_data = Dataset.from_pandas(val_data)
-test_data = Dataset.from_pandas(test_data)
-
+train_data = df["messages"].to_list()
+val_data = df2["messages"].to_list()
+test_data = df3["messages"].to_list()
 
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AdamW, BitsAndBytesConfig, get_scheduler, DataCollatorWithPadding
@@ -117,14 +110,12 @@ for name in layers:
     print(name)
 
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 
 # tokenisation
 def tokenize_function(dataset):
-    messages = dataset["messages"]
-    
-    encoding = tokenizer.apply_chat_template(messages,
+    encoding = tokenizer.apply_chat_template(dataset,
             tokenize=True,
             padding=True,
             truncation=True,
@@ -132,36 +123,60 @@ def tokenize_function(dataset):
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True)
+    encoding["labels"] = encoding["input_ids"].clone()
     return encoding
 
-train_data = train_data.map(tokenize_function, batched=True)
-val_data = val_data.map(tokenize_function, batched=True)
-test_data = test_data.map(tokenize_function, batched=True)
+train_data = tokenize_function(train_data)
+val_data = tokenize_function(val_data)
+test_data = tokenize_function(test_data)
+
+
+class TokenizedDataset(Dataset):
+    def __init__(self, tokenized_data):
+        self.tokenized_data = tokenized_data
+
+    def __len__(self):
+        return len(self.tokenized_data['input_ids'])
+
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.tokenized_data.items()}
+        return item
+
+train_dataset = TokenizedDataset(train_data)
+val_dataset = TokenizedDataset(val_data)
+test_dataset = TokenizedDataset(test_data)
+
+
 
 #add special tokens to shorter sequences
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-train_dataloader = DataLoader(train_data, batch_size=8, shuffle=True, collate_fn=data_collator)
-val_dataloader = DataLoader(val_data, batch_size=8, shuffle=False, collate_fn=data_collator)
-test_dataloader = DataLoader(test_data, batch_size=8, shuffle=False, collate_fn=data_collator)
+train_dataloader = DataLoader(train_dataset, batch_size=5, shuffle=True, collate_fn=data_collator)
+val_dataloader = DataLoader(val_dataset, batch_size=5, shuffle=False, collate_fn=data_collator)
+test_dataloader = DataLoader(test_dataset, batch_size=5, shuffle=False, collate_fn=data_collator)
 
 #check
 for batch in train_dataloader:
-    break
-{k: v.shape for k,v in batch.items()}
+   {k: v.shape for k,v in batch.items()}
 
 
 """## Training"""
 
 from tqdm.auto import tqdm
-
+from torch.cuda.amp import GradScaler, autocast
+import torch.nn as nn
+#device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+#model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 num_epochs = 50
 num_train_steps = len(train_data) * num_epochs
 
-train_data, val_data, model, optimizer = accelerate.prepare(train_data, val_data, model, optimizer)
+accelerator = Accelerator()
+train_data, val_data, model, optimizer = accelerator.prepare(train_data, val_data, model, optimizer)
 #Training
+
+
 
 lr_scheduler = get_scheduler(
             "linear",
@@ -170,20 +185,32 @@ lr_scheduler = get_scheduler(
             num_training_steps = num_train_steps,
         )
 
-progress_bar = tqdm(range(num_train_steps))
+progress_bar = tqdm(range(num_train_steps), desc="Training")
+
 
 model.train()
-losses = []
+tr_loss = []
+
 for epoch in range(num_epochs):
     for batch in train_dataloader:
+        #batch = {k: v.to(device) for k, v in batch.items()}
         outputs = model(**batch)
         loss = outputs.loss
-        loss.backward()
+    
+        #clear gradients
+        optimizer.zero_grad()
 
+        #compute gradients
+        accelerator.backward(loss)
+        #update weights
         optimizer.step()
+        #update lr
         lr_scheduler.step()
+       # scaler.update()
         progress_bar.update(1)
 
-        losses.append(loss.item())
+        tr_loss.append(loss.item())
+    print(f"Epoch {epoch+1}/{num_epochs}, {loss.item()}")
+progress_bar.close()
 
-torch.save(m.state_dict(), 'natural_sql.pt')
+torch.save(model.state_dict(), 'natural_sql.pt')
