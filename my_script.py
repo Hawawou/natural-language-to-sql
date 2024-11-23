@@ -4,13 +4,15 @@ import torch
 from datasets import load_dataset
 import json
 
-dataset = load_dataset("b-mc2/sql-create-context", split="train")
+dataset = load_dataset("Salesforce/wikisql", trust_remote_code=True)
 
 # split the dataset into training, validation and test
-dataset_test = dataset.train_test_split(test_size=0.2) 
+dataset_train = dataset['train'].shuffle().select(range(3000))
+dataset_val = dataset['validation'].shuffle().select(range(1000))
+dataset_test = dataset['test'].shuffle().select(range(1000))
 
 # split the dataset into training and validation
-dataset = dataset_test['train'].train_test_split(test_size=0.2)
+#dataset = dataset_test['train'].train_test_split(test_size=0.2)
 
 """## Mistral 7b
 
@@ -18,20 +20,27 @@ dataset = dataset_test['train'].train_test_split(test_size=0.2)
 """
 
 # forma data
-system_message = """You are a natural language to sql query translator model. Users will ask you a question in English and you will generate a SQL query based on the table provided: {schema}"""
+import json
+system_message = """You are a natural language to sql query translator model. Users will ask you a question in English and you will generate a SQL query based on the table provided: {table}"""
 
 def format_data(dataset):
-    return {
+
+    # format table
+    try:
+        table_str = json.dumps(dataset["table"], indent=4)
+        return {
         "messages": [
-            {"role": "system", "content": system_message.format(schema=dataset["context"])},
+            {"role": "system", "content": system_message.format(table=table_str)},
             {"role": "user", "content": dataset["question"]},
-            {"role": "assistant", "content": dataset["answer"]}
+            {"role": "assistant", "content": dataset["sql"]["human_readable"]}
         ]}
+    except KeyError as e:
+        print("Missing key in dataset: {e}")
+        return None
 
-
-train_data = dataset["train"].map(format_data)
-test_data = dataset_test["test"].map(format_data)
-val_data = dataset["test"].map(format_data)
+train_data = dataset_train.map(format_data)
+val_data = dataset_val.map(format_data)
+test_data = dataset_test.map(format_data)
 
 df = pd.DataFrame(train_data)
 df2 = pd.DataFrame(val_data)
@@ -41,6 +50,10 @@ train_data = df["messages"].to_list()
 val_data = df2["messages"].to_list()
 test_data = df3["messages"].to_list()
 
+
+from huggingface_hub import login
+
+login(token='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')
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AdamW, BitsAndBytesConfig, get_scheduler, DataCollatorWithPadding
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
@@ -105,9 +118,9 @@ lora_config = LoraConfig(
 model = get_peft_model(model, lora_config)
 print_trainable_parameters(model)
 
-layers = model.state_dict().keys()
-for name in layers:
-    print(name)
+#layers = model.state_dict().keys()
+#for name in layers:
+#    print(name)
 
 
 from torch.utils.data import DataLoader, Dataset
@@ -127,7 +140,7 @@ def tokenize_function(dataset):
     return encoding
 
 train_data = tokenize_function(train_data)
-val_data = tokenize_function(val_data)
+#val_data = tokenize_function(val_data)
 test_data = tokenize_function(test_data)
 
 
@@ -143,7 +156,7 @@ class TokenizedDataset(Dataset):
         return item
 
 train_dataset = TokenizedDataset(train_data)
-val_dataset = TokenizedDataset(val_data)
+#val_dataset = TokenizedDataset(val_data)
 test_dataset = TokenizedDataset(test_data)
 
 
@@ -152,7 +165,7 @@ test_dataset = TokenizedDataset(test_data)
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 train_dataloader = DataLoader(train_dataset, batch_size=5, shuffle=True, collate_fn=data_collator)
-val_dataloader = DataLoader(val_dataset, batch_size=5, shuffle=False, collate_fn=data_collator)
+#val_dataloader = DataLoader(val_dataset, batch_size=5, shuffle=False, collate_fn=data_collator)
 test_dataloader = DataLoader(test_dataset, batch_size=5, shuffle=False, collate_fn=data_collator)
 
 #check
@@ -164,16 +177,16 @@ for batch in train_dataloader:
 
 from tqdm.auto import tqdm
 from torch.cuda.amp import GradScaler, autocast
-import torch.nn as nn
+
 #device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 #model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-num_epochs = 50
+optimizer = AdamW(model.parameters(), lr=5e-5)
+num_epochs = 3
 num_train_steps = len(train_data) * num_epochs
 
 accelerator = Accelerator()
-train_data, val_data, model, optimizer = accelerator.prepare(train_data, val_data, model, optimizer)
+train_data, model, optimizer = accelerator.prepare(train_data, model, optimizer)
 #Training
 
 
@@ -185,12 +198,11 @@ lr_scheduler = get_scheduler(
             num_training_steps = num_train_steps,
         )
 
-progress_bar = tqdm(range(num_train_steps), desc="Training")
+progress_bar = tqdm(range(num_train_steps))
 
 
 model.train()
 tr_loss = []
-
 for epoch in range(num_epochs):
     for batch in train_dataloader:
         #batch = {k: v.to(device) for k, v in batch.items()}
